@@ -1,0 +1,279 @@
+# The submission gate. Issue iot49/rails49#57 decides what it asserts, #62 what
+# it looks like; `tools/r49-validate` in iot49/rails49 does the deciding, and
+# everything here is rendering.
+#
+# Two jobs, because they answer to different things:
+#
+# * `archives` judges what this pull request submitted. Pull requests only —
+#   there is no base to diff against otherwise.
+# * `guidance` judges whether CONTRIBUTING.md's generated capture table still
+#   matches the arithmetic it came from. That table is derived from
+#   `layout.min_dpt` over in rails49, so it goes stale from *outside* this
+#   repository, on a pull request that touched nothing near it. It therefore
+#   runs on every pull request, not only ones carrying a `.r49`.
+#
+# There is no vendored copy of the validator and no published package: this
+# checks out rails49 at `main` and runs it from there (rails49#55). The cost is
+# exactly the coupling above — a change to `min_dpt` in rails49 reddens the next
+# pull request here. That is intended, and the failure message says so at
+# length, because otherwise it reads as the contributor's fault.
+name: validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # The guidance check can go stale with no commit here at all. This is how a
+  # maintainer confirms it without inventing a pull request.
+  workflow_dispatch:
+
+# Every contributor pull request is a fork pull request, where `GITHUB_TOKEN` is
+# read-only anyway. Stating it makes that a choice rather than an accident:
+# `::warning` annotations and `$GITHUB_STEP_SUMMARY` need no token at all, which
+# is why rails49#57 chose them over a bot comment.
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  archives:
+    name: archives
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the changed-file diff needs the base commit present.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/checkout@v7
+        with:
+          repository: iot49/rails49
+          ref: main
+          path: rails49
+
+      # The toolchain is read out of the rails49 checkout, never restated here —
+      # `packageManager` and `.nvmrc` are the declaration rails49#55 made the
+      # corpus depend on, and rails49's own CI consumes the same two files.
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: rails49/package.json
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: rails49/.nvmrc
+          cache: pnpm
+          cache-dependency-path: rails49/pnpm-lock.yaml
+
+      # Only the validator's own subtree. A bare install would pull `ui`'s
+      # onnxruntime-web and `dataset`'s sharp — native builds this job never
+      # loads. Validating a zip costs jszip, zod and tsx.
+      - name: Install the validator
+        working-directory: rails49
+        run: pnpm install --frozen-lockfile --filter "@occupancy/r49-validate..."
+
+      # NUL-delimited, and never split on whitespace. A filename with a space in
+      # it is precisely what the slug rule exists to reject — so it has to reach
+      # the validator intact in order to be rejected by name, rather than
+      # arriving as two paths that do not exist.
+      - name: Find the archives this pull request changes
+        id: changed
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git diff --diff-filter=ACMR -z --name-only "$BASE" HEAD -- '*.r49' \
+            > "$RUNNER_TEMP/changed.nul"
+          git diff --diff-filter=A -z --name-only "$BASE" HEAD -- '*.r49' \
+            | tr '\0' '\n' > "$RUNNER_TEMP/added.txt"
+          # `tr -d ' '` because wc pads its count on some platforms, and the
+          # step that reads this output compares it against the string "0".
+          count=$(tr -cd '\0' < "$RUNNER_TEMP/changed.nul" | wc -c | tr -d ' ')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "$count archive(s) changed."
+
+      - name: No archives changed
+        if: steps.changed.outputs.count == '0'
+        run: |
+          {
+            echo "## Archives"
+            echo
+            echo "This pull request changes no \`.r49\` files, so there was nothing to validate."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # stdout is the machine rendering and stderr the human one — one code path
+      # produces both, so the annotations and the log cannot disagree about what
+      # was found. `--author` comes through the environment rather than through
+      # `${{ }}` interpolation, so a handle is never pasted into a shell.
+      - name: Validate
+        id: validate
+        if: steps.changed.outputs.count != '0'
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          paths=()
+          while IFS= read -r -d '' path; do paths+=("$path"); done \
+            < "$RUNNER_TEMP/changed.nul"
+          printf 'validating %s\n' "${paths[@]}"
+
+          set +e
+          rails49/tools/r49-validate/node_modules/.bin/tsx \
+            rails49/tools/r49-validate/src/cli.ts --author "$AUTHOR" -- "${paths[@]}" \
+            > "$RUNNER_TEMP/report.json" 2> "$RUNNER_TEMP/report.txt"
+          status=$?
+          set -e
+
+          cat "$RUNNER_TEMP/report.txt"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+          # 2 is the tool failing, never an archive being rejected. Nothing was
+          # judged, so there is no report to render and no annotation to hang on
+          # a contributor's file.
+          if [ "$status" -eq 2 ]; then
+            {
+              echo "## Archives"
+              echo
+              echo "**The validator itself failed — this is not about your submission.**"
+              echo "Please tell a maintainer; the log has the stack trace."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+
+      # GitHub shows at most ten annotations per level per step, so the summary
+      # below — which lists every finding — is the complete record and this is
+      # the convenient one. Message text is escaped per the workflow-command
+      # rules: `%` first, then the line breaks.
+      - name: Annotate the findings
+        if: always() && steps.validate.outputs.status != '' && steps.validate.outputs.status != '2'
+        run: |
+          jq -r '
+            def esc: gsub("%";"%25") | gsub("\r";"%0D") | gsub("\n";"%0A");
+            .archives[] | .path as $p |
+              (.errors[]   | "::error file=\($p),title=r49-validate::\(.message | esc)"),
+              (.warnings[] | "::warning file=\($p),title=r49-validate::\(.message | esc)")
+          ' "$RUNNER_TEMP/report.json"
+
+      # The fact table rails49#57 asks for: id, DPT, residual, counts — read by
+      # a maintainer deciding whether to accept, and deliberately carrying no
+      # grade. The residual is reported and never thresholded; no calibrated
+      # threshold exists, and inventing one here would put a number into the
+      # pipeline that nothing earned.
+      #
+      # `new`/`update` is the one column the validator cannot supply: it is a
+      # git fact, not an archive fact.
+      - name: Summarise
+        if: always() && steps.validate.outputs.status != '' && steps.validate.outputs.status != '2'
+        run: |
+          {
+            echo "## Archives"
+            echo
+            echo "| Archive | Change | Scope | id | DPT | Residual px | Images | Labels | Complete | Errors | Warnings |"
+            echo "| :--- | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+            jq -r --rawfile added "$RUNNER_TEMP/added.txt" '
+              ($added | split("\n") | map(select(length > 0))) as $new |
+              def dash: if . == null then "—" else tostring end;
+              def round1: if . == null then "—" else ((. * 10 | round) / 10 | tostring) end;
+              .archives[] | .path as $p |
+              "| `\($p)` | \(if ($new | index($p)) then "new" else "update" end) | \(.scope)"
+              + " | `\(.id | dash)` | \(.dpt | round1) | \(.dptResidual | round1)"
+              + " | \(.images | dash) | \(.labels | dash) | \(.complete | dash)/\(.images | dash)"
+              + " | \(.errors | length) | \(.warnings | length) |"
+            ' "$RUNNER_TEMP/report.json"
+            echo
+
+            findings=$(jq -r '
+              .archives[] | .path as $p |
+                (.errors[]   | "- ❌ `\($p)` — \(.message)"),
+                (.warnings[] | "- ⚠️ `\($p)` — \(.message)")
+            ' "$RUNNER_TEMP/report.json")
+
+            if [ -n "$findings" ]; then
+              echo "### Findings"
+              echo
+              echo "$findings"
+              echo
+              echo "❌ blocks the merge. ⚠️ does not — it is a quality signal for the maintainer to read."
+            fi
+
+            echo
+            echo "Warnings never fail this check. The bar CI cannot set is whether the boxes"
+            echo "actually land on the cars; see CONTRIBUTING.md."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Block on errors
+        if: always() && steps.validate.outputs.status == '1'
+        run: |
+          echo "At least one archive carries a blocking error; see the findings above." >&2
+          exit 1
+
+  guidance:
+    name: capture guidance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/checkout@v7
+        with:
+          repository: iot49/rails49
+          ref: main
+          path: rails49
+
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: rails49/package.json
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: rails49/.nvmrc
+          cache: pnpm
+          cache-dependency-path: rails49/pnpm-lock.yaml
+
+      - name: Install the validator
+        working-directory: rails49
+        run: pnpm install --frozen-lockfile --filter "@occupancy/r49-validate..."
+
+      # The comparison and its wording live in the validator, where `pnpm test`
+      # covers them — not in this file, which nothing covers. The wording is the
+      # deliverable: the usual cause of a failure here is a change in rails49,
+      # a repository the contributor reading the message has never touched.
+      - name: Check CONTRIBUTING.md against the arithmetic it came from
+        run: |
+          set +e
+          rails49/tools/r49-validate/node_modules/.bin/tsx \
+            rails49/tools/r49-validate/src/cli.ts guidance --check CONTRIBUTING.md \
+            2> "$RUNNER_TEMP/guidance.txt"
+          status=$?
+          set -e
+
+          cat "$RUNNER_TEMP/guidance.txt"
+
+          if [ "$status" -eq 0 ]; then
+            {
+              echo "## Capture guidance"
+              echo
+              echo "✅ \`CONTRIBUTING.md\` matches \`r49-validate guidance\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "## Capture guidance"
+            echo
+            if [ "$status" -eq 2 ]; then
+              echo "**The check itself failed — this is not about your submission.**"
+              echo "Please tell a maintainer."
+            fi
+            echo '```'
+            cat "$RUNNER_TEMP/guidance.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # One annotation on the file, carrying the whole message. `%` first,
+          # then every newline, per the workflow-command escaping rules.
+          message=$(sed -e 's/%/%25/g' "$RUNNER_TEMP/guidance.txt" \
+            | awk '{ printf "%s%%0A", $0 }')
+          echo "::error file=CONTRIBUTING.md,title=Capture guidance is out of date::$message"
+
+          exit "$status"
