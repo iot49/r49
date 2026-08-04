@@ -35,11 +35,15 @@ to live. Renaming or moving a file does not make it a different archive — whic
 is why the same layout submitted by two people lands in two directories without
 anything being wrong.
 
-`fixtures/` is deliberately not under `archives/`. Those six carry **zero
-labels** and sit below the minimum resolution: they exist so the editor has
-something to open, not so anything can train on them. Glob `archives/**/*.r49`
-and you get real submissions only. They will be deleted once better data
-supersedes them.
+`fixtures/` is deliberately not under `archives/`. Those six sit below the
+minimum resolution and exist so the editor has something to open, not so
+anything can train on them. Glob `archives/**/*.r49` and you get real
+submissions only. They will be deleted once better data supersedes them.
+
+Five of the six carry **no labels at all**. `lighting.r49` now carries 30, added
+by hand — useful for exercising the editor against real labels, and still not a
+submission: it is under the minimum resolution and it is here rather than in
+`archives/`. Do not train on it.
 
 ## Submitting
 
